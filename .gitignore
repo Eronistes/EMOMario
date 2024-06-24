@@ -1,0 +1,15 @@
+toadstool/participants
+.cache
+.oldvscode-server
+.vscode
+.vscode-server
+checkpoints
+EMOcheckpoints
+toadstool/*.pdf
+.bash_history
+cuda-repo-ubuntu2204-12-1-local_12.1.0-530.30.02-1_amd64.deb
+.motd_shown
+README.md
+toadstool/README.txt
+toadstool/questionnaire_answers.csv
+toadstool/LICENSE
