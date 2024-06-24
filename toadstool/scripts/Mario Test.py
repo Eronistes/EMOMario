@@ -158,13 +158,13 @@ class Mario:
 
     def act(self, state):
         """
-    Given a state, choose an epsilon-greedy action and update value of step.
+        Given a state, choose an epsilon-greedy action and update value of step.
 
-    Inputs:
-    state(``LazyFrame``): A single observation of the current state, dimension is (state_dim)
-    Outputs:
-    ``action_idx`` (``int``): An integer representing which action Mario will perform
-    """
+        Inputs:
+        state(``LazyFrame``): A single observation of the current state, dimension is (state_dim)
+        Outputs:
+        ``action_idx`` (``int``): An integer representing which action Mario will perform
+        """
         # EXPLORE
         if np.random.rand() < self.exploration_rate:
             action_idx = np.random.randint(self.action_dim)
@@ -270,10 +270,6 @@ class Mario:
 
         loss = self.update_q_online(td_estimate, td_target)
 
-        """        #Memory cleanup
-        del state, next_state, action, reward, done
-        torch.cuda.empty_cache()"""
-
         return (td_estimate.mean().item(), loss)
 
     def save(self, step):
@@ -300,6 +296,20 @@ class Mario:
         self.exploration_rate = checkpoint['exploration_rate']
         self.curr_step = checkpoint['step']
         print(f"Model loaded from {load_path}")
+
+    def observe(self, states, actions, rewards, dones, next_states):
+        """
+        Store a batch of observed experiences to the replay buffer
+
+        Inputs:
+        states (list of ``LazyFrame``),
+        actions (list of ``int``),
+        rewards (list of ``float``),
+        dones (list of ``bool``),
+        next_states (list of ``LazyFrame``)
+        """
+        for state, action, reward, done, next_state in zip(states, actions, rewards, dones, next_states):
+            self.cache(state, next_state, action, reward, done)
 
 class MetricLogger:
     def __init__(self, save_dir):
@@ -455,9 +465,10 @@ def replay_game_from_actions(env, mario, session_path, logger, render_screen=Fal
     stage = 1
     finish = False
 
-        # Initialize variables to store skipped frames for learning
+    # Initialize variables to store skipped frames for learning
     skip = 4
     stacked_frames = deque(maxlen=skip)
+    state = next_state
 
     for action in data["obs"]:
         if render_screen:
@@ -468,11 +479,9 @@ def replay_game_from_actions(env, mario, session_path, logger, render_screen=Fal
         # Check the length of the result to unpack correctly
         if len(result) == 4:
             next_state, reward, done, info = result  # Old API format
-            print(done, ' Done')
         elif len(result) == 5:
             next_state, reward, terminated, truncated, info = result  # New API format
             done = terminated or truncated
-
         else:
             raise ValueError("Unexpected result format from env.step(action)")
 
@@ -480,26 +489,16 @@ def replay_game_from_actions(env, mario, session_path, logger, render_screen=Fal
 
         steps += 1
 
+        # Cache the current experience
+        mario.cache(state, next_state, action, reward, done)
+        state = next_state
 
-        # Store frames for the emulator
-        if isinstance(next_state, np.ndarray):
-            next_state = np.copy(next_state)
-
-        # Stack frames for learning
-        stacked_frames.append(next_state)
-        if len(stacked_frames) == skip:
-            stack = np.stack(stacked_frames, axis=0)
-            stack = torch.tensor(stack, dtype=torch.float32)
-
-            mario.cache(stack, stack, action, reward, done)
-            q, loss = mario.learn()
-            logger.log_step(reward, loss, q)
-
+        # Perform learning step
+        q, loss = mario.learn()
+        logger.log_step(reward, loss, q)
 
         if info.get("flag_get"):
-            print('get ')
             finish = True
-
 
         if done:
             if finish or steps >= 16000:
@@ -507,12 +506,15 @@ def replay_game_from_actions(env, mario, session_path, logger, render_screen=Fal
                 world, stage, new_world = make_next_stage(world, stage, stage_num)
                 env.close()
                 torch.cuda.empty_cache()
-                env = make_env(world,stage)
+                env = make_env(world, stage)
                 finish = False
                 steps = 0
             
             next_state = env.reset()
-            stacked_frames.clear()
+            state = next_state
+
+    env.close()
+    torch.cuda.empty_cache()
 
         
 
