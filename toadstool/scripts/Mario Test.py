@@ -135,7 +135,7 @@ class Mario:
         self.net = self.net.to(device=self.device)
 
         # Initialize exploration parameters
-        self.exploration_rate = 1
+        self.exploration_rate = 0.1
         self.exploration_rate_decay = 0.99999975
         self.exploration_rate_min = 0.1
         self.curr_step = 0
@@ -197,14 +197,17 @@ class Mario:
         """
         def first_if_tuple(x):
             return x[0] if isinstance(x, tuple) else x
-        
         state = first_if_tuple(state).__array__()
         next_state = first_if_tuple(next_state).__array__()
-        state = torch.tensor(state, dtype=torch.float32).to(self.device)
-        next_state = torch.tensor(next_state, dtype=torch.float32).to(self.device)
-        action = torch.tensor([action], dtype=torch.int64).to(self.device)
-        reward = torch.tensor([reward], dtype=torch.float32).to(self.device)
-        done = torch.tensor([done], dtype=torch.float32).to(self.device)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+
+            state = torch.tensor(state)
+            next_state = torch.tensor(next_state)
+            action = torch.tensor([action])
+            reward = torch.tensor([reward])
+            done = torch.tensor([done])
 
 
         self.memory.add(TensorDict({
@@ -352,6 +355,10 @@ class MetricLogger:
             self.curr_ep_loss += loss
             self.curr_ep_q += q
             self.curr_ep_loss_length += 1
+        time = 0
+        time+1
+        if time%20000 == 0:
+            print(f'Reward: {self.curr_ep_reward}')
 
     def log_episode(self):
         "Mark end of episode"
@@ -491,6 +498,7 @@ def replay_game_from_actions(env, mario, session_path, logger, render_screen=Fal
 
         # Cache the current experience
         mario.cache(state, next_state, action, reward, done)
+        mario.act(state)
         state = next_state
 
         # Perform learning step
@@ -504,6 +512,7 @@ def replay_game_from_actions(env, mario, session_path, logger, render_screen=Fal
             if finish or steps >= 16000:
                 stage_num += 1
                 world, stage, new_world = make_next_stage(world, stage, stage_num)
+                print( f"Step {mario.curr_step} - ")
                 env.close()
                 torch.cuda.empty_cache()
                 env = make_env(world, stage)
@@ -516,10 +525,6 @@ def replay_game_from_actions(env, mario, session_path, logger, render_screen=Fal
     env.close()
     torch.cuda.empty_cache()
 
-        
-
-    env.close()
-    torch.cuda.empty_cache()
 
 def make_env(world, stage, skip=4, shape=(84, 84)):
     with warnings.catch_warnings():
@@ -527,7 +532,7 @@ def make_env(world, stage, skip=4, shape=(84, 84)):
         if gym.__version__ < '0.26':
             env = gym_super_mario_bros.make(f'SuperMarioBros-{world}-{stage}-v0', new_step_api=True)
         else:
-            env = gym_super_mario_bros.make(f'SuperMarioBros-{world}-{stage}-v0', render_mode='rgb', apply_api_compatibility=True)
+            env = gym_super_mario_bros.make(f'SuperMarioBros-{world}-{stage}-v0', render_mode='human', apply_api_compatibility=True)
             print(f'{world}-{stage}')
    # env = SkipFrame(env, skip)
     env = GrayScaleObservation(env)
@@ -557,8 +562,9 @@ save_dir = Path("EMOcheckpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%
 save_dir.mkdir(parents=True)
 env = make_env(1,1)
 
-choice = 'new'
-custom_save_dir = "checkpoints/2024-06-16T10-56-29/mario_net_step:2500000.pth"
+choice = 'load'
+action = 'ai'
+custom_save_dir = "EMOcheckpoints/2024-06-25T11-12-28/mario_net_5725160.chkpt"
 
 # Start a new model or load an existing one based on user choice
 if choice == 'new':
@@ -570,26 +576,57 @@ else:
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
 
+if action == 'learn':
+    logger = MetricLogger(save_dir)
 
-logger = MetricLogger(save_dir)
+    # Training loop
+    finished = 0
+    episodes = 12000
+    session_path = os.path.join(data_dir, single_participant["participant_id"], f"{single_participant['participant_id']}_session.json")
+    for e in range(episodes):
+        print(f"Replaying session for participant: {single_participant['participant_id']}, Episode: {e+1}/{episodes}")
+        replay_game_from_actions(env, mario, session_path, logger, render_screen=False)
+        env = make_env(1,1)
+        logger.log_episode()
+        mario.save(mario.curr_step)
+        print(
+        f"Episode {e} - "
+        f"Step {mario.curr_step} - "
+        f"Epsilon {mario.exploration_rate} - ")
+        if e % 5 == 0:
+            logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step, Finished=finished)
 
-# Training loop
-finished = 0
-episodes = 12000
-session_path = os.path.join(data_dir, single_participant["participant_id"], f"{single_participant['participant_id']}_session.json")
-for e in range(episodes):
-    print(f"Replaying session for participant: {single_participant['participant_id']}, Episode: {e+1}/{episodes}")
-    replay_game_from_actions(env, mario, session_path, logger, render_screen=False)
-    env = make_env(1,1)
-    logger.log_episode()
-    print(
-    f"Episode {e} - "
-    f"Step {mario.curr_step} - "
-    f"Epsilon {mario.exploration_rate} - ")
-    if e % 20 == 0:
-        logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step, Finished=finished)
+    print("Training completed.")
 
-print("Training completed.")
+elif action == 'ai':
+    state = env.reset()
+    done = False
+    cumulative_reward = 0.0
+    episodes = 100
+
+    for e in range(episodes):
+
+
+        while not done:
+            action = mario.act(state)  # Choose action based on the trained policy
+            result = env.step(action)
+            if len(result) == 4:
+                next_state, reward, done, info = result  # Old API format
+            elif len(result) == 5:
+                next_state, reward, terminated, truncated, info = result  # New API format
+                done = terminated or truncated
+            else:
+                raise ValueError("Unexpected result format from env.step(action)")
+            cumulative_reward += reward
+            state = next_state  # Update current state to the next state
+
+            # Optionally render the environment to watch the agent's behavior
+            #env.render()
+
+        print(f"Total Cumulative Reward: {cumulative_reward}")
+        env.close()
+        env = make_env(1,1)
+
 
 
 """# Training loop all participants
