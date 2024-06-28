@@ -135,7 +135,7 @@ class Mario:
         self.net = self.net.to(device=self.device)
 
         # Initialize exploration parameters
-        self.exploration_rate = 0.1
+        self.exploration_rate = 1
         self.exploration_rate_decay = 0.99999975
         self.exploration_rate_min = 0.1
         self.curr_step = 0
@@ -153,7 +153,7 @@ class Mario:
 
         # Initialize synchronization parameters
         self.sync_every = 10000  # Synchronize target network every 10000 steps
-        self.burnin = 10000  # Start learning after 10000 steps
+        self.burnin = 1000  # Start learning after 10000 steps
         self.learn_every = 4  # Update the online network every 4 steps
 
     def act(self, state):
@@ -195,6 +195,7 @@ class Mario:
         reward (``float``),
         done(``bool``))
         """
+        #print(state, next_state, action,reward)
         def first_if_tuple(x):
             return x[0] if isinstance(x, tuple) else x
         state = first_if_tuple(state).__array__()
@@ -203,19 +204,19 @@ class Mario:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
 
-            state = torch.tensor(state)
-            next_state = torch.tensor(next_state)
-            action = torch.tensor([action])
-            reward = torch.tensor([reward])
-            done = torch.tensor([done])
-
+            stateT = torch.tensor(state)
+            next_stateT = torch.tensor(next_state)
+            actionT = torch.tensor([action])
+            rewardT = torch.tensor([reward])
+            doneT = torch.tensor([done])
+        #print(stateT,next_stateT,actionT,rewardT)
 
         self.memory.add(TensorDict({
-            "state": state,
-            "next_state": next_state,
-            "action": action,
-            "reward": reward,
-            "done": done
+            "state": stateT,
+            "next_state": next_stateT,
+            "action": actionT,
+            "reward": rewardT,
+            "done": doneT
         }, batch_size=[]))
 
     def recall(self):
@@ -265,7 +266,7 @@ class Mario:
 
         if self.curr_step < self.burnin or self.curr_step % self.learn_every != 0:
             return None, None
-
+        
         state, next_state, action, reward, done = self.recall()
 
         td_estimate = self.td_estimate(state, action)
@@ -300,129 +301,174 @@ class Mario:
         self.curr_step = checkpoint['step']
         print(f"Model loaded from {load_path}")
 
-    def observe(self, states, actions, rewards, dones, next_states):
+
+    def update_policy(self, cumulative_reward, logger):
         """
-        Store a batch of observed experiences to the replay buffer
+        Update policy based on cumulative reward using Q-learning update.
 
         Inputs:
-        states (list of ``LazyFrame``),
-        actions (list of ``int``),
-        rewards (list of ``float``),
-        dones (list of ``bool``),
-        next_states (list of ``LazyFrame``)
+        cumulative_reward (float): The cumulative reward accumulated during the replay session.
+        logger (MetricLogger): Object for logging metrics like reward and loss.
         """
-        for state, action, reward, done, next_state in zip(states, actions, rewards, dones, next_states):
-            self.cache(state, next_state, action, reward, done)
+        # Decay exploration rate (optional, if using epsilon-greedy)
+        self.exploration_rate *= self.exploration_rate_decay
+        self.exploration_rate = max(self.exploration_rate_min, self.exploration_rate)
+
+        # Update Q-values based on cumulative reward
+        alpha = self.lr  # Learning rate (could be different from self.lr if desired)
+
+        # Sample a batch of experiences from memory
+        state, next_state, action, reward, done = self.recall()
+
+        # Compute TD targets and estimates for the entire batch
+        next_state_Q = self.net(next_state, model="online")
+        best_actions = torch.argmax(next_state_Q, axis=1)
+        next_Q_values = self.net(next_state, model="target")[torch.arange(self.batch_size), best_actions]
+        td_targets = reward + (1 - done.float()) * self.gamma * next_Q_values
+
+        current_Q_values = self.net(state, model="online")[torch.arange(self.batch_size), action]
+        td_estimates = current_Q_values
+
+        # Calculate loss using Smooth L1 Loss (Huber loss)
+        loss = self.loss_fn(td_estimates, td_targets)
+
+        # Optimize the model
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+
+        # Synchronize target network periodically (optional)
+        if self.curr_step % self.sync_every == 0:
+            self.sync_q_target()
+
+        return loss.item()
+
+
 
 class MetricLogger:
     def __init__(self, save_dir):
-        self.save_log = save_dir / "log"
+        self.save_log = Path(save_dir) / "log"
         with open(self.save_log, "w") as f:
             f.write(
-                f"{'Episode':>8}{'Step':>8}{'Epsilon':>10}{'MeanReward':>15}"
-                f"{'MeanLength':>15}{'MeanLoss':>15}{'MeanQValue':>15}"
-                f"{'Finished':>15}"
-                f"{'TimeDelta':>15}{'Time':>20}\n"
+                "Episode,Step,AvgReward,MaxReward,MinReward,StdReward,AvgLoss,MaxLoss,MinLoss,StdLoss,AvgQ,MaxQ,MinQ,StdQ\n"
             )
-        self.ep_rewards_plot = save_dir / "reward_plot.jpg"
-        self.ep_lengths_plot = save_dir / "length_plot.jpg"
-        self.ep_avg_losses_plot = save_dir / "loss_plot.jpg"
-        self.ep_avg_qs_plot = save_dir / "q_plot.jpg"
 
-        # History metrics
-        self.ep_rewards = []
-        self.ep_lengths = []
-        self.ep_avg_losses = []
-        self.ep_avg_qs = []
+        self.ep_rewards = deque(maxlen=100)
+        self.ep_lengths = deque(maxlen=100)
+        self.ep_avg_losses = deque(maxlen=100)
+        self.ep_avg_qs = deque(maxlen=100)
 
-        # Moving averages, added for every call to record()
-        self.moving_avg_ep_rewards = []
-        self.moving_avg_ep_lengths = []
-        self.moving_avg_ep_avg_losses = []
-        self.moving_avg_ep_avg_qs = []
-        self.times_finished = []
+        self.episode_data = []
+        self.reset_episode_metrics()
 
-        # Current episode metric
-        self.init_episode()
-
-        # Timing
         self.record_time = time.time()
+        self.plot_dir = Path(save_dir) / "plots"
+        self.plot_dir.mkdir(parents=True, exist_ok=True)
+
+    def reset_episode_metrics(self):
+        self.metrics = {
+            'avg_reward': 0,
+            'max_reward': 0,
+            'min_reward': 0,
+            'std_reward': 0,
+            'avg_loss': 0,
+            'max_loss': 0,
+            'min_loss': 0,
+            'std_loss': 0,
+            'avg_q': 0,
+            'max_q': 0,
+            'min_q': 0,
+            'std_q': 0,
+        }
 
     def log_step(self, reward, loss, q):
-        self.curr_ep_reward += reward
-        self.curr_ep_length += 1
-        if loss:
-            self.curr_ep_loss += loss
-            self.curr_ep_q += q
-            self.curr_ep_loss_length += 1
-        time = 0
-        time+1
-        if time%20000 == 0:
-            print(f'Reward: {self.curr_ep_reward}')
+        self.episode_data.append({
+            'reward': reward,
+            'loss': loss if loss is not None else 0,
+            'q': q if q is not None else 0
+        })
 
-    def log_episode(self):
-        "Mark end of episode"
-        self.ep_rewards.append(self.curr_ep_reward)
-        self.ep_lengths.append(self.curr_ep_length)
-        if self.curr_ep_loss_length == 0:
-            ep_avg_loss = 0
-            ep_avg_q = 0
-        else:
-            ep_avg_loss = np.round(self.curr_ep_loss / self.curr_ep_loss_length, 5)
-            ep_avg_q = np.round(self.curr_ep_q / self.curr_ep_loss_length, 5)
-        self.ep_avg_losses.append(ep_avg_loss)
-        self.ep_avg_qs.append(ep_avg_q)
-        print("episode log ")
-        self.init_episode()
 
-    def init_episode(self):
-        self.curr_ep_reward = 0.0
-        self.curr_ep_length = 0
-        self.curr_ep_loss = 0.0
-        self.curr_ep_q = 0.0
-        self.curr_ep_loss_length = 0
+    def log_episode(self, episode, step):
+        if not self.episode_data:
+            return self.metrics
 
-    def record(self, episode, epsilon, step, Finished):
-        mean_ep_reward = np.round(np.mean(self.ep_rewards[-100:]), 3)
-        mean_ep_length = np.round(np.mean(self.ep_lengths[-100:]), 3)
-        mean_ep_loss = np.round(np.mean(self.ep_avg_losses[-100:]), 3)
-        mean_ep_q = np.round(np.mean(self.ep_avg_qs[-100:]), 3)
-        self.moving_avg_ep_rewards.append(mean_ep_reward)
-        self.moving_avg_ep_lengths.append(mean_ep_length)
-        self.moving_avg_ep_avg_losses.append(mean_ep_loss)
-        self.moving_avg_ep_avg_qs.append(mean_ep_q)
+        rewards = [data['reward'] for data in self.episode_data]
+        losses = [data['loss'] for data in self.episode_data]
+        qs = [data['q'] for data in self.episode_data]
 
-        last_record_time = self.record_time
-        self.record_time = time.time()
-        time_since_last_record = np.round(self.record_time - last_record_time, 3)
+        self.metrics['avg_reward'] = np.mean(rewards)
+        self.metrics['max_reward'] = np.max(rewards)
+        self.metrics['min_reward'] = np.min(rewards)
+        self.metrics['std_reward'] = np.std(rewards)
 
-        print(
-            f"Episode {episode} - "
-            f"Step {step} - "
-            f"Epsilon {epsilon} - "
-            f"Mean Reward {mean_ep_reward} - "
-            f"Mean Length {mean_ep_length} - "
-            f"Mean Loss {mean_ep_loss} - "
-            f"Mean Q Value {mean_ep_q} - "
-            f"Time Delta {time_since_last_record} - "
-            f"Finished {Finished} - "
-            f"Time {datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}"
-        )
 
+        self.metrics['avg_loss'] = np.mean(losses)
+        self.metrics['max_loss'] = np.max(losses)
+        self.metrics['min_loss'] = np.min(losses)
+        self.metrics['std_loss'] = np.std(losses)
+
+
+        self.metrics['avg_q'] = np.mean(qs)
+        self.metrics['max_q'] = np.max(qs)
+        self.metrics['min_q'] = np.min(qs)
+        self.metrics['std_q'] = np.std(qs)
+
+        self.ep_rewards.append(self.metrics['avg_reward'])
+        self.ep_lengths.append(len(self.episode_data))
+        self.ep_avg_losses.append(self.metrics['avg_loss'])
+        self.ep_avg_qs.append(self.metrics['avg_q'])
+
+        self._log_to_file(episode, step)
+        self.episode_data = []
+
+        return self.metrics
+
+    def _log_to_file(self, episode, step):
         with open(self.save_log, "a") as f:
             f.write(
-                f"{episode:8d}{step:8d}{epsilon:10.3f}"
-                f"{mean_ep_reward:15.3f}{mean_ep_length:15.3f}{mean_ep_loss:15.3f}{mean_ep_q:15.3f}"
-                f"{time_since_last_record:15.3f}"
-                f"{Finished:15.3f}"
-                f"{datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S'):>20}\n"
+                f"{episode},{step},{self.metrics['avg_reward']},{self.metrics['max_reward']},{self.metrics['min_reward']},{self.metrics['std_reward']},"
+                f"{self.metrics['avg_loss']},{self.metrics['max_loss']},{self.metrics['min_loss']},{self.metrics['std_loss']},"
+                f"{self.metrics['avg_q']},{self.metrics['max_q']},{self.metrics['min_q']},{self.metrics['std_q']}\n"
             )
 
-        for metric in ["ep_lengths", "ep_avg_losses", "ep_avg_qs", "ep_rewards"]:
-            plt.clf()
-            plt.plot(getattr(self, f"moving_avg_{metric}"), label=f"moving_avg_{metric}")
-            plt.legend()
-            plt.savefig(getattr(self, f"{metric}_plot"))
+    def record(self, episode, epsilon, step):
+        mean_ep_reward = np.mean(self.ep_rewards)
+        mean_ep_length = np.mean(self.ep_lengths)
+        mean_ep_loss = np.mean(self.ep_avg_losses)
+        mean_ep_q = np.mean(self.ep_avg_qs)
+
+        print(f"Episode {episode} - Step {step} - "
+              f"Mean Reward: {mean_ep_reward:.2f} - "
+              f"Mean Length: {mean_ep_length:.2f} - "
+              f"Mean Loss: {mean_ep_loss:.2f} - "
+              f"Mean Q Value: {mean_ep_q:.2f} - "
+              f"Epsilon: {epsilon:.2f}")
+
+        # Reset episode metrics after logging
+        self.plot_metrics()
+        self.reset_episode_metrics()
+
+
+    def plot_metrics(self):
+        self._plot_metric(self.ep_rewards, 'Avg Reward', 'Reward')
+        self._plot_metric(self.ep_avg_losses, 'Avg Loss', 'Loss')
+        self._plot_metric(self.ep_avg_qs, 'Avg Q Value', 'Q Value')
+
+    def _plot_metric(self, metric, title, ylabel):
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(len(metric)), metric, label=title)
+        plt.title(title)
+        plt.xlabel('Episode')
+        plt.ylabel(ylabel)
+        plt.legend()
+
+        plot_path = self.plot_dir / f"{title.replace(' ', '_').lower()}.png"
+        plt.savefig(plot_path)
+        plt.close()
+
+        print(f"Updated plot for {title} at {plot_path}")
 
 _STAGE_ORDER = [
     (1, 1),
@@ -461,7 +507,7 @@ def make_next_stage(world, stage, num):
 
 
 
-def replay_game_from_actions(env, mario, session_path, logger, render_screen=False):
+def replay_game_from_actions(env, mario = Mario, session_path = str, logger = MetricLogger, render_screen=False):
     with open(session_path) as json_file:
         data = json.load(json_file)
 
@@ -476,12 +522,14 @@ def replay_game_from_actions(env, mario, session_path, logger, render_screen=Fal
     skip = 4
     stacked_frames = deque(maxlen=skip)
     state = next_state
+    cumulative_reward = 0.0
 
     for action in data["obs"]:
         if render_screen:
             env.render()
 
         result = env.step(action)
+        mario.act(state)
 
         # Check the length of the result to unpack correctly
         if len(result) == 4:
@@ -496,9 +544,10 @@ def replay_game_from_actions(env, mario, session_path, logger, render_screen=Fal
 
         steps += 1
 
+        cumulative_reward += reward
+
         # Cache the current experience
         mario.cache(state, next_state, action, reward, done)
-        mario.act(state)
         state = next_state
 
         # Perform learning step
@@ -512,7 +561,7 @@ def replay_game_from_actions(env, mario, session_path, logger, render_screen=Fal
             if finish or steps >= 16000:
                 stage_num += 1
                 world, stage, new_world = make_next_stage(world, stage, stage_num)
-                print( f"Step {mario.curr_step} - ")
+                mario.update_policy(cumulative_reward, logger)
                 env.close()
                 torch.cuda.empty_cache()
                 env = make_env(world, stage)
@@ -532,7 +581,7 @@ def make_env(world, stage, skip=4, shape=(84, 84)):
         if gym.__version__ < '0.26':
             env = gym_super_mario_bros.make(f'SuperMarioBros-{world}-{stage}-v0', new_step_api=True)
         else:
-            env = gym_super_mario_bros.make(f'SuperMarioBros-{world}-{stage}-v0', render_mode='human', apply_api_compatibility=True)
+            env = gym_super_mario_bros.make(f'SuperMarioBros-{world}-{stage}-v0', render_mode='rgb', apply_api_compatibility=True)
             print(f'{world}-{stage}')
    # env = SkipFrame(env, skip)
     env = GrayScaleObservation(env)
@@ -562,8 +611,8 @@ save_dir = Path("EMOcheckpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%
 save_dir.mkdir(parents=True)
 env = make_env(1,1)
 
-choice = 'load'
-action = 'ai'
+choice = 'new'
+action = 'learn'
 custom_save_dir = "EMOcheckpoints/2024-06-25T11-12-28/mario_net_5725160.chkpt"
 
 # Start a new model or load an existing one based on user choice
@@ -587,14 +636,12 @@ if action == 'learn':
         print(f"Replaying session for participant: {single_participant['participant_id']}, Episode: {e+1}/{episodes}")
         replay_game_from_actions(env, mario, session_path, logger, render_screen=False)
         env = make_env(1,1)
-        logger.log_episode()
+        logger.log_episode(e, mario.curr_step)
         mario.save(mario.curr_step)
         print(
-        f"Episode {e} - "
-        f"Step {mario.curr_step} - "
-        f"Epsilon {mario.exploration_rate} - ")
+        f"Episode {e} - ")
         if e % 5 == 0:
-            logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step, Finished=finished)
+            logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step)
 
     print("Training completed.")
 
