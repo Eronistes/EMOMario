@@ -1,6 +1,8 @@
 import os
+import numpy as np
 import pandas as pd
 import json
+from scipy.signal import find_peaks
 
 def load_participant_data(dataset_path):
     participants = []
@@ -31,6 +33,9 @@ def load_participant_data(dataset_path):
         ibi_data = pd.read_csv(ibi_path) if os.path.exists(ibi_path) else print('error ibi')
         temp_data = pd.read_csv(temp_path) if os.path.exists(temp_path) else print('error temp')
 
+        # Prepare BVP data
+        bvp_data_processed = prepare_bvp(bvp_data)
+
         # Paths to JSON files
         gap_info_path = os.path.join(participant_folder, f"{participant_id}_gap_info.json")
         session_path = os.path.join(participant_folder, f"{participant_id}_session.json")
@@ -50,7 +55,7 @@ def load_participant_data(dataset_path):
         # Store all data in participant_data dictionary
         participant_data['participant_id'] = participant_id
         participant_data['ACC'] = acc_data
-        participant_data['BVP'] = bvp_data
+        participant_data['BVP'] = bvp_data_processed
         participant_data['EDA'] = eda_data
         participant_data['HR'] = hr_data
         participant_data['IBI'] = ibi_data
@@ -96,6 +101,9 @@ def load_single_participant(dataset_path, participant_number):
     ibi_data = pd.read_csv(ibi_path) if os.path.exists(ibi_path) else print(f'Error: IBI data not found for participant {participant_id}')
     temp_data = pd.read_csv(temp_path) if os.path.exists(temp_path) else print(f'Error: TEMP data not found for participant {participant_id}')
 
+    # Prepare BVP data
+    bvp_data_processed = prepare_bvp(bvp_data)
+
     # Paths to JSON files
     gap_info_path = os.path.join(participant_folder, f"{participant_id}_gap_info.json")
     session_path = os.path.join(participant_folder, f"{participant_id}_session.json")
@@ -115,7 +123,7 @@ def load_single_participant(dataset_path, participant_number):
     # Store all data in participant_data dictionary
     participant_data['participant_id'] = participant_id
     participant_data['ACC'] = acc_data
-    participant_data['BVP'] = bvp_data
+    participant_data['BVP'] = bvp_data_processed
     participant_data['EDA'] = eda_data
     participant_data['HR'] = hr_data
     participant_data['IBI'] = ibi_data
@@ -125,20 +133,48 @@ def load_single_participant(dataset_path, participant_number):
     participant_data['video_info'] = video_info
     participant_data['video_path'] = video_path
 
+    print(type(participant_data['BVP']))
+
     return participant_data
 
+def prepare_bvp(bvp_data):
+   # print(bvp_data)
+    # Convert the BVP data column to a numpy array
+    bvp_data = bvp_data.to_numpy().flatten()
+    
+    # Normalize the BVP signal to a range between -1 and 1
+    normalized_bvp = 2 * (bvp_data - np.min(bvp_data)) / (np.max(bvp_data) - np.min(bvp_data)) - 1
+    
+    # Replace negative values with 0
+    normalized_bvp[normalized_bvp < 0] = 0
+    
+    # Find systolic peaks with minimum distance of 40
+    peaks, _ = find_peaks(normalized_bvp, distance=40)
+    
+    # Create a new array for the processed BVP amplitudes
+    processed_bvp = np.zeros_like(normalized_bvp)
+    
+    # Duplicate the peak values across the index space between peaks
+    for i in range(len(peaks) - 1):
+        processed_bvp[peaks[i]:peaks[i+1]] = normalized_bvp[peaks[i]]
+    
+    # Ensure the last peak value is duplicated to the end of the array
+    processed_bvp[peaks[-1]:] = normalized_bvp[peaks[-1]]
+    
+    # Replace values below 0.1 with their predecessor values
+    for i in range(1, len(processed_bvp)):
+        if processed_bvp[i] < 0.1:
+            processed_bvp[i] = processed_bvp[i - 1]
+    
+    # Adjust sample rate: remove every 16th sample and then every other sample
+    processed_bvp = np.delete(processed_bvp, np.arange(0, processed_bvp.size, 16))
+    processed_bvp = processed_bvp[::2]
+    
+    return processed_bvp
+
+# Example usage
 
 # Example usage:
-dataset_path = "toadstool/participants"
-participants_data = load_participant_data(dataset_path)
-"""
-# Now participants_data is a list of dictionaries, each containing data for one participant
-# You can access individual participant's data like this:
-for participant in participants_data:
-    print(f"Participant ID: {participant['participant_id']}")
-    print(f"Number of ACC samples: {len(participant['ACC']) if participant['ACC'] is not None else 'N/A'}")
-    print(f"Number of BVP samples: {len(participant['BVP']) if participant['BVP'] is not None else 'N/A'}")
-    print(f"Session start time: {participant['session_info']['score']}")
-    print(f"Number of gaps: {len(participant['gap_info']['indices'])}")
-    print(f"Video duration: {participant['video_info']['start_time']} seconds")
-    print(f"---------------------------------------")"""
+#dataset_path = "toadstool/participants"
+#participants_data = load_single_participant(dataset_path, 0)
+#prepared_bvp = prepare_bvp(participants_data["BVP"], 40)
