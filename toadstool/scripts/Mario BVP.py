@@ -192,7 +192,9 @@ class Mario:
         next_stateT = torch.tensor(next_state).to(self.device)
         actionT = torch.tensor([action]).to(self.device)
         rewardT = torch.tensor([reward]).to(self.device)
-        doneT = torch.tensor([done]).to(self.device)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            doneT = torch.tensor([done]).to(self.device)
         emotional_rewardT = torch.tensor([emotional_reward]).to(self.device)
 
         self.memory.add(TensorDict({
@@ -202,7 +204,7 @@ class Mario:
             "reward": rewardT,
             "done": doneT,
             "emotional_reward": emotional_rewardT
-        }))
+        }, batch_size=[]))
 
     def recall(self):
         batch = self.memory.sample(self.batch_size).to(self.device)
@@ -210,6 +212,13 @@ class Mario:
             batch.get(key) for key in ("state", "next_state", "action", "reward", "done", "emotional_reward")
         )
         return state, next_state, action.squeeze(), reward.squeeze(), done.squeeze(), emotional_reward.squeeze()
+    
+    def td_estimate(self, state, action):
+        """
+        Compute TD estimate (Q-value)
+        """
+        current_q = self.net(state, model="online")[torch.arange(0, self.batch_size), action]
+        return current_q
 
     @torch.no_grad()
     def td_target(self, reward, emotional_reward, next_state, done):
@@ -240,7 +249,6 @@ class Mario:
             return None, None
         
         state, next_state, action, reward, done, emotional_reward = self.recall()
-
         td_estimate = self.td_estimate(state, action)
         td_target = self.td_target(reward, emotional_reward, next_state, done)
 
@@ -354,12 +362,14 @@ class MetricLogger:
             'std_q': 0,
         }
 
-    def log_step(self, reward, loss, q):
+    def log_step(self, reward, loss, q, emotional_reward):
         self.episode_data.append({
             'reward': reward,
-            'loss': loss if loss is not None else 0,
-            'q': q if q is not None else 0
+            'loss': loss if loss is not None and not np.isnan(loss) else 0,
+            'q': q if q is not None and not np.isnan(q) else 0,
+            'emotional_reward': emotional_reward
         })
+
 
 
     def log_episode(self, episode, step):
@@ -369,6 +379,7 @@ class MetricLogger:
         rewards = [data['reward'] for data in self.episode_data]
         losses = [data['loss'] for data in self.episode_data]
         qs = [data['q'] for data in self.episode_data]
+        emotional_rewards = [data['emotional_reward'] for data in self.episode_data]
 
         self.metrics['avg_reward'] = np.mean(rewards)
         self.metrics['max_reward'] = np.max(rewards)
@@ -387,10 +398,16 @@ class MetricLogger:
         self.metrics['min_q'] = np.min(qs)
         self.metrics['std_q'] = np.std(qs)
 
+        self.metrics['avg_emotional_reward'] = np.mean(emotional_rewards)
+        self.metrics['max_emotional_reward'] = np.max(emotional_rewards)
+        self.metrics['min_emotional_reward'] = np.min(emotional_rewards)
+        self.metrics['std_emotional_reward'] = np.std(emotional_rewards)
+
         self.ep_rewards.append(self.metrics['avg_reward'])
         self.ep_lengths.append(len(self.episode_data))
         self.ep_avg_losses.append(self.metrics['avg_loss'])
         self.ep_avg_qs.append(self.metrics['avg_q'])
+        self.ep_emotional_rewards.append(self.metrics['avg_emotional_reward'])
 
         self._log_to_file(episode, step)
         self.episode_data = []
@@ -399,23 +416,26 @@ class MetricLogger:
 
     def _log_to_file(self, episode, step):
         with open(self.save_log, "a") as f:
-            f.write(
+           f.write(
                 f"{episode},{step},{self.metrics['avg_reward']},{self.metrics['max_reward']},{self.metrics['min_reward']},{self.metrics['std_reward']},"
                 f"{self.metrics['avg_loss']},{self.metrics['max_loss']},{self.metrics['min_loss']},{self.metrics['std_loss']},"
-                f"{self.metrics['avg_q']},{self.metrics['max_q']},{self.metrics['min_q']},{self.metrics['std_q']}\n"
+                f"{self.metrics['avg_q']},{self.metrics['max_q']},{self.metrics['min_q']},{self.metrics['std_q']},"
+                f"{self.metrics['avg_emotional_reward']},{self.metrics['max_emotional_reward']},{self.metrics['min_emotional_reward']},{self.metrics['std_emotional_reward']}\n"
             )
-
+           
     def record(self, episode, epsilon, step):
         mean_ep_reward = np.mean(self.ep_rewards)
         mean_ep_length = np.mean(self.ep_lengths)
         mean_ep_loss = np.mean(self.ep_avg_losses)
         mean_ep_q = np.mean(self.ep_avg_qs)
+        mean_ep_emotional_reward = np.mean(self.ep_emotional_rewards)
 
         print(f"Episode {episode} - Step {step} - "
               f"Mean Reward: {mean_ep_reward:.2f} - "
               f"Mean Length: {mean_ep_length:.2f} - "
               f"Mean Loss: {mean_ep_loss:.2f} - "
               f"Mean Q Value: {mean_ep_q:.2f} - "
+              f"Mean Emotional Reward: {mean_ep_emotional_reward:.2f} - "
               f"Epsilon: {epsilon:.2f}")
 
         # Reset episode metrics after logging
@@ -427,6 +447,7 @@ class MetricLogger:
         self._plot_metric(self.ep_rewards, 'Avg Reward', 'Reward')
         self._plot_metric(self.ep_avg_losses, 'Avg Loss', 'Loss')
         self._plot_metric(self.ep_avg_qs, 'Avg Q Value', 'Q Value')
+        self._plot_metric(self.ep_emotional_rewards, 'Avg Emotional Reward', 'Emotional Reward')
 
     def _plot_metric(self, metric, title, ylabel):
         plt.figure(figsize=(10, 5))
@@ -507,7 +528,7 @@ def calculate_emotional_reward(memory, bvp_amplitude, min_peak_value, weighting_
     return total_reward
 
 
-def replay_game_from_actions(env, mario = Mario, session_path = str, logger = MetricLogger, bvp_data = np.ndarray, render_screen=False):
+def replay_game_from_actions(env, mario, session_path, logger, bvp_data, render_screen=False):
     with open(session_path) as json_file:
         data = json.load(json_file)
 
@@ -519,18 +540,16 @@ def replay_game_from_actions(env, mario = Mario, session_path = str, logger = Me
     finish = False
     min_peak_value = 0.1
     weighting_factor = 0.5
-
-    # Initialize variables to store skipped frames for learning
-    skip = 4
-    stacked_frames = deque(maxlen=skip)
     state = next_state
     cumulative_reward = 0.0
+    bvp_step = 0
+    memory = []  # List to store frames for calculating emotional reward
+
+
     for action in data["obs"]:
         if render_screen:
             env.render()
-
         result = env.step(action)
-        mario.act(state)
 
 
         # Check the length of the result to unpack correctly
@@ -541,28 +560,32 @@ def replay_game_from_actions(env, mario = Mario, session_path = str, logger = Me
             done = terminated or truncated
         else:
             raise ValueError("Unexpected result format from env.step(action)")
-
+        mario.act(next_state)  
         done = done or info.get('flag_get', False)
 
         steps += 1
-
+        bvp_step += 1
         cumulative_reward += reward
 
-         # Calculate BVP amplitude (amp') for the current state/frame 
-        bvp_amplitude = bvp_data[steps]
-
-
-        # Calculate emotional reward using the custom function
-        emotional_reward = calculate_emotional_reward([{'state': state}], bvp_amplitude, min_peak_value, weighting_factor)
-
+        # Calculate BVP amplitude (amp') for the current state/frame 
+        bvp_amplitude = bvp_data[bvp_step]
+        emotional_reward = calculate_emotional_reward(memory, bvp_amplitude, min_peak_value, weighting_factor)
 
         # Cache the current experience
-        mario.cache(state, next_state, action, reward, done, emotional_reward)
-        state = next_state
+        mario.cache(state, next_state, action, reward, done, emotional_reward)  # Assuming cache() is updated to take bvp_amplitude
+        state =next_state
+        # Prepare frame for memory
+        frame = {
+            'state': next_state,  # Adjust this according to how you store state in Mario class
+            'action': action,
+            'reward': reward,
+            'emotional_reward': emotional_reward
+        }
 
+        memory.append(frame)
         # Perform learning step
         q, loss = mario.learn()
-        logger.log_step(reward, loss, q)
+        logger.log_step(reward, loss, q, emotional_reward)
 
         if info.get("flag_get"):
             finish = True
@@ -571,7 +594,7 @@ def replay_game_from_actions(env, mario = Mario, session_path = str, logger = Me
             if finish or steps >= 16000:
                 stage_num += 1
                 world, stage, new_world = make_next_stage(world, stage, stage_num)
-                mario.update_policy(cumulative_reward, logger)
+                #mario.update_policy(cumulative_reward, logger)
                 env.close()
                 torch.cuda.empty_cache()
                 env = make_env(world, stage)
@@ -579,10 +602,13 @@ def replay_game_from_actions(env, mario = Mario, session_path = str, logger = Me
                 steps = 0
             
             next_state = env.reset()
+
             state = next_state
 
     env.close()
+    memory = []  # Reset memory after finishing an episode
     torch.cuda.empty_cache()
+
 
 
 def make_env(world, stage, skip=4, shape=(84, 84)):
@@ -596,7 +622,7 @@ def make_env(world, stage, skip=4, shape=(84, 84)):
    # env = SkipFrame(env, skip)
     env = GrayScaleObservation(env)
     env = ResizeObservation(env, shape)
-    #env = gym.wrappers.FrameStack(env, skip)
+    env = gym.wrappers.FrameStack(env, skip)
     return env
 
 # Function to start a new Mario instance
@@ -614,7 +640,7 @@ def load_existing_mario(load_dir, save_dir):
 
 data_dir = "toadstool/participants"
 toadstool_data = toadstool_data_loader.load_participant_data(data_dir)
-single_participant = toadstool_data_loader.load_single_participant(data_dir, 1)
+single_participant = toadstool_data_loader.load_single_participant(data_dir, 0)
 
 # Initialize DDQN components
 save_dir = Path("EMOcheckpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")

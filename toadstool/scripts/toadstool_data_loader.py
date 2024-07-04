@@ -133,12 +133,11 @@ def load_single_participant(dataset_path, participant_number):
     participant_data['video_info'] = video_info
     participant_data['video_path'] = video_path
 
-    print(type(participant_data['BVP']))
 
     return participant_data
 
 def prepare_bvp(bvp_data):
-   # print(bvp_data)
+
     # Convert the BVP data column to a numpy array
     bvp_data = bvp_data.to_numpy().flatten()
     

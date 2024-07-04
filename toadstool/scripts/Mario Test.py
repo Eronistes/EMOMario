@@ -504,7 +504,33 @@ def make_next_stage(world, stage, num):
     return world, stage, f"SuperMarioBros-{world}-{stage}-v0"
 
 
+def calculate_emotional_reward(memory, bvp_amplitude, min_peak_value, weighting_factor):
+    """
+    Calculate emotional reward for a given memory in the DQN.
 
+    Parameters:
+    - memory (list): A list of game frames stored in memory.
+    - bvp_amplitude (float): Normalized BVP amplitude (amp') associated with the memory.
+    - min_peak_value (float): Minimum peak value used in BVP amplitude preprocessing.
+    - weighting_factor (float): Weighting factor (W) between 0 and 1, to adjust emotional reward emphasis.
+
+    Returns:
+    - emotional_reward (float): Total emotional reward for the memory.
+    """
+    # Calculate intrinsic emotional reward (Ri)
+    amp0 = (bvp_amplitude - min_peak_value) / (1 - min_peak_value)
+    Ri = (amp0 - 0.5) * 5
+
+    # Combine intrinsic emotional reward with extrinsic reward for each frame in memory
+    total_emotional_reward = 0.0
+    for frame in memory:
+        total_emotional_reward += Ri
+
+    # Calculate total combined reward using the weighting factor (W)
+    Re = np.sum([frame['reward'] for frame in memory])  # Extrinsic reward sum for all frames
+    total_reward = Re * (1 - weighting_factor) + total_emotional_reward * weighting_factor
+
+    return total_reward
 
 
 def replay_game_from_actions(env, mario = Mario, session_path = str, logger = MetricLogger, render_screen=False):
@@ -604,16 +630,16 @@ def load_existing_mario(load_dir, save_dir):
 
 data_dir = "toadstool/participants"
 toadstool_data = toadstool_data_loader.load_participant_data(data_dir)
-single_participant = toadstool_data_loader.load_single_participant(data_dir, 0)
+single_participant = toadstool_data_loader.load_single_participant(data_dir, 1)
 
 # Initialize DDQN components
 save_dir = Path("EMOcheckpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 save_dir.mkdir(parents=True)
 env = make_env(1,1)
 
-choice = 'new'
+choice = 'load'
 action = 'learn'
-custom_save_dir = "EMOcheckpoints/2024-06-25T11-12-28/mario_net_5725160.chkpt"
+custom_save_dir = "EMOcheckpoints/2024-07-02T15-38-06/mario_net_9281302.chkpt"
 
 # Start a new model or load an existing one based on user choice
 if choice == 'new':
@@ -672,6 +698,7 @@ elif action == 'ai':
 
         print(f"Total Cumulative Reward: {cumulative_reward}")
         env.close()
+        env.reset()
         env = make_env(1,1)
 
 
