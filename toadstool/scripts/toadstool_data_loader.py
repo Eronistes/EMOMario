@@ -120,6 +120,16 @@ def load_single_participant(dataset_path, participant_number):
     with open(video_info_path) as f:
         video_info = json.load(f)
 
+    # print(len(session_info['obs']))
+    #print(len(bvp_data_processed))
+
+      # Check and adjust length of bvp_data_processed
+    if len(bvp_data_processed) != len(session_info['obs']):
+        if len(bvp_data_processed) < len(session_info['obs']):
+            zeros_to_add = len(session_info['obs']) - len(bvp_data_processed)
+            bvp_data_processed = np.append(bvp_data_processed, np.zeros(zeros_to_add))
+            print(f"Warning: Added {zeros_to_add} zeros to BVP data to match session_info length.")
+
     # Store all data in participant_data dictionary
     participant_data['participant_id'] = participant_id
     participant_data['ACC'] = acc_data
@@ -166,8 +176,8 @@ def prepare_bvp(bvp_data):
             processed_bvp[i] = processed_bvp[i - 1]
     
     # Adjust sample rate: remove every 16th sample and then every other sample
-    processed_bvp = np.delete(processed_bvp, np.arange(0, processed_bvp.size, 16))
-    processed_bvp = processed_bvp[::2]
+    # processed_bvp = np.delete(processed_bvp, np.arange(0, processed_bvp.size, 16))
+    # processed_bvp = processed_bvp[::2]
     
     return processed_bvp
 
@@ -175,5 +185,4 @@ def prepare_bvp(bvp_data):
 
 # Example usage:
 #dataset_path = "toadstool/participants"
-#participants_data = load_single_participant(dataset_path, 0)
-#prepared_bvp = prepare_bvp(participants_data["BVP"], 40)
+#participants_data = load_single_participant(dataset_path, 3)
