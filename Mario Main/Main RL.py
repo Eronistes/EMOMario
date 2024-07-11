@@ -1,3 +1,4 @@
+import warnings
 import torch
 from torch import nn
 from torchvision import transforms as T
@@ -20,19 +21,6 @@ import gym_super_mario_bros
 
 from tensordict import TensorDict
 from torchrl.data import TensorDictReplayBuffer, LazyMemmapStorage
-
-# Initialize Super Mario environment (in v0.26 change render mode to 'human' to see results on the screen)
-if gym.__version__ < '0.26':
-    env = gym_super_mario_bros.make("SuperMarioBros-1-1-v2", new_step_api=True)
-else:
-    env = gym_super_mario_bros.make("SuperMarioBros-1-1-v2", render_mode='rgb', apply_api_compatibility=True)
-
-# Limit the action-space to
-#   0. walk right
-#   1. jump right
-env = JoypadSpace(env, [["right"], ["right", "A"],  ["right", "B"],  ["right", "B","A"]])
-
-
 
 class SkipFrame(gym.Wrapper):
     def __init__(self, env, skip):
@@ -391,7 +379,7 @@ class MetricLogger:
             f.write(
                 f"{'Episode':>8}{'Step':>8}{'Epsilon':>10}{'MeanReward':>15}"
                 f"{'MeanLength':>15}{'MeanLoss':>15}{'MeanQValue':>15}"
-                f"{'Finished':>15}"
+                f"{'Finished':>15}{'Score':>15}"
                 f"{'TimeDelta':>15}{'Time':>20}\n"
             )
         self.ep_rewards_plot = save_dir / "reward_plot.jpg"
@@ -410,7 +398,8 @@ class MetricLogger:
         self.moving_avg_ep_lengths = []
         self.moving_avg_ep_avg_losses = []
         self.moving_avg_ep_avg_qs = []
-        self.times_finished = []
+        self.high_score = 0
+        self.total_game_completions = 0
 
         # Current episode metric
         self.init_episode()
@@ -426,7 +415,7 @@ class MetricLogger:
             self.curr_ep_q += q
             self.curr_ep_loss_length += 1
 
-    def log_episode(self):
+    def log_episode(self, score):
         "Mark end of episode"
         self.ep_rewards.append(self.curr_ep_reward)
         self.ep_lengths.append(self.curr_ep_length)
@@ -438,6 +427,8 @@ class MetricLogger:
             ep_avg_q = np.round(self.curr_ep_q / self.curr_ep_loss_length, 5)
         self.ep_avg_losses.append(ep_avg_loss)
         self.ep_avg_qs.append(ep_avg_q)
+        if self.high_score < score:
+            self.high_score = score
 
         self.init_episode()
 
@@ -471,7 +462,8 @@ class MetricLogger:
             f"Mean Loss {mean_ep_loss} - "
             f"Mean Q Value {mean_ep_q} - "
             f"Time Delta {time_since_last_record} - "
-            f"Finished {Finished} - "
+            f"Score {self.high_score} - "
+            f"Finished {self.total_game_completions} - "
             f"Time {datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}"
         )
 
@@ -479,8 +471,9 @@ class MetricLogger:
             f.write(
                 f"{episode:8d}{step:8d}{epsilon:10.3f}"
                 f"{mean_ep_reward:15.3f}{mean_ep_length:15.3f}{mean_ep_loss:15.3f}{mean_ep_q:15.3f}"
+                f"{self.total_game_completions:15.3f}"
+                f"{self.high_score:15.3f}"
                 f"{time_since_last_record:15.3f}"
-                f"{Finished:15.3f}"
                 f"{datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S'):>20}\n"
             )
 
@@ -489,23 +482,68 @@ class MetricLogger:
             plt.plot(getattr(self, f"moving_avg_{metric}"), label=f"moving_avg_{metric}")
             plt.legend()
             plt.savefig(getattr(self, f"{metric}_plot"))
+    
+    def log_game_completion(self, episode):
+        self.total_game_completions += 1
+        print(f"Episode {episode} - Game Completed - Total Completions: {self.total_game_completions}")
 
+_STAGE_ORDER = [
+    (1, 1),
+    (1, 2),
+    (1, 3),
+    (2, 2),
+    (1, 4),
+    (3, 1),
+    (4, 1),
+    (2, 1),
+    (2, 3),
+    (2, 4),
+    (3, 2),
+    (3, 3),
+    (3, 4),
+    (4, 2)
+]
 
+def make_next_stage(world, stage, num):
+    if num < len(_STAGE_ORDER):
+        world = _STAGE_ORDER[num][0]
+        stage = _STAGE_ORDER[num][1]
+    else:
+        if stage >= 4:
+            stage = 1
+            if world >= 8:
+                world = 1
+            else:
+                world += 1
+        else:
+            stage += 1
 
+    return world, stage, f"SuperMarioBros-{world}-{stage}-v0"
 
-# Apply Wrappers to environment
-env = SkipFrame(env, skip=4)
-env = GrayScaleObservation(env)
-env = ResizeObservation(env, shape=84)
-if gym.__version__ < '0.26':
-    env = FrameStack(env, num_stack=4, new_step_api=True)
-else:
-    env = FrameStack(env, num_stack=4)
+def make_env(world, stage, skip=4, shape=(84, 84)):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if gym.__version__ < '0.26':
+            env = gym_super_mario_bros.make(f'SuperMarioBros-{world}-{stage}-v0', new_step_api=True)
+        else:
+            env = gym_super_mario_bros.make(f'SuperMarioBros-{world}-{stage}-v0', render_mode='rgb', apply_api_compatibility=True)
+    
 
+    env = JoypadSpace(env, [["right"], ["right", "A"],  ["right", "B"],  ["right", "B","A"]])
+    env = SkipFrame(env, skip)
+    env = GrayScaleObservation(env)
+    env = ResizeObservation(env, shape)
+    env = gym.wrappers.FrameStack(env, skip)
+    return env
 
+env = make_env(1,1)
+
+stage_num = 0
+world = 1
+score = 0
+stage = 1
 use_cuda = torch.cuda.is_available()
 print(f"Using CUDA: {use_cuda}")
-print()
 
 # Function to start a new Mario instance
 def start_new_mario(save_dir):
@@ -518,12 +556,12 @@ def load_existing_mario(load_dir, save_dir):
     return mario_instance
 
 # Default values
-choice = 'new'
-custom_save_dir = "checkpoints/2024-06-16T10-56-29/mario_net_step:2500000.pth"
+choice = 'load'
+custom_save_dir = "Scorecheckpoints/2024-07-10T08-20-57/mario_net_step:3000000.pth"
 
 
 
-save_dir = Path("checkpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+save_dir = Path("Scorecheckpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 save_dir.mkdir(parents=True)
 
 # Start a new model or load an existing one based on user choice
@@ -564,17 +602,32 @@ for e in range(episodes):
 
         # Check if end of game
         if done:
-            break
-        
-        if info["flag_get"]:
-            finished+=1
-            break
 
-    logger.log_episode()
+            if score < info["score"]:
+                score = info["score"]
+                  
+            if info["flag_get"]:
+                stage_num += 1
+                if world == 8 and stage == 4:
+                    logger.log_game_completion(episode=e)
+                world, stage, new_world = make_next_stage(world, stage, stage_num)
+                env.close()
+                env = make_env(world, stage)
+                print(f'{world}-{stage}')
+            else:
+                env.close()
+                env  = make_env(1,1)
+                world =1
+                stage =1
+            break
+    logger.log_episode(score)
 
     if (e % 20 == 0) or (e == episodes - 1):
         logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step, Finished=finished)
 
     if (e % 1000 == 0) or (e == episodes - 1):
         mario.save(mario.curr_step)
+
+    env.close()
+    env = make_env(1, 1)
     
