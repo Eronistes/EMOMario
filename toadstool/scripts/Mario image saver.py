@@ -202,20 +202,16 @@ def make_env(world, stage, skip=4, shape=(84, 84)):
 
 data_dir = "toadstool/participants"
 toadstool_data = toadstool_data_loader.load_participant_data(data_dir)
-single_participant = toadstool_data_loader.load_single_participant(data_dir, 6)
+single_participant = toadstool_data_loader.load_single_participant(data_dir, 9)
 
 # Initialize DDQN components
 save_dir = Path("EMOcheckpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 save_dir.mkdir(parents=True)
 env = make_env(1,1)
 
-choice = 'new'
-action = 'learn'
-custom_save_dir = "EMOcheckpoints/2024-07-07T10-33-01/mario_net_4605020.chkpt"
-
 
 session_path = os.path.join(data_dir, single_participant["participant_id"], f"{single_participant['participant_id']}_session.json")
-output_directory = "toadstool/images/par_6"
+output_directory = "toadstool/images/par_9"
 replay_game_save_frames(env, session_path, output_directory, render_screen=False)
 
 
