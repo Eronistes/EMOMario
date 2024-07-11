@@ -1,3 +1,4 @@
+import logging
 import os
 import json
 import time
@@ -114,6 +115,37 @@ class MarioNet(nn.Module):
             nn.Linear(512, output_dim)
         )
         return cnn
+    
+        # BVP prediciton
+        # def build_cnn(self, c, h, w, output_dim):
+        # """
+        # Build the CNN architecture
+        # """
+        # cnn = nn.Sequential(
+        #     nn.Conv2d(in_channels=c, out_channels=32, kernel_size=3, stride=3),
+        #     nn.ReLU(),
+        #     nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, stride=3),
+        #     nn.ReLU(),
+        #     nn.MaxPool2d(kernel_size=2, stride=2),
+        #     nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=3),
+        #     nn.ReLU(),
+        #     nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=3),
+        #     nn.ReLU(),
+        #     nn.MaxPool2d(kernel_size=2, stride=2),
+        #     nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=3),
+        #     nn.ReLU(),
+        #     nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=3),
+        #     nn.ReLU(),
+        #     nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=3),
+        #     nn.ReLU(),
+        #     nn.MaxPool2d(kernel_size=2, stride=2),
+        #     nn.Flatten(),
+        #     nn.Linear(64, 128),  # Assumption: After flattening, there are 64 neurons
+        #     nn.ReLU(),
+        #     nn.Dropout(0.5),
+        #     nn.Linear(128, 1)  # Output layer for regression
+        # )
+        # return cnn
 
     def forward(self, input, model):
         if model == "online":
@@ -213,6 +245,11 @@ class Mario:
         )
         return state, next_state, action.squeeze(), reward.squeeze(), done.squeeze(), emotional_reward.squeeze()
     
+    def handle_nan_values(self, tensor):
+        # Replace NaN values with 0.0
+        tensor[torch.isnan(tensor)] = 0.0
+        return tensor
+    
     def td_estimate(self, state, action):
         """
         Compute TD estimate (Q-value)
@@ -249,8 +286,19 @@ class Mario:
             return None, None
         
         state, next_state, action, reward, done, emotional_reward = self.recall()
+
+        # if self.curr_step % 500 == 0:
+        #     print(f"Step: {self.curr_step}")
+        #     print(f"State: {state}")
+        #     print(f"Action: {action}")
+        #     print(f"Reward: {reward}")     
+        new_reward = self.handle_nan_values(reward)   
         td_estimate = self.td_estimate(state, action)
-        td_target = self.td_target(reward, emotional_reward, next_state, done)
+        td_target = self.td_target(new_reward, emotional_reward, next_state, done)
+
+        # if self.curr_step % 500 == 0:
+        #     print(f"TD Estimate: {td_estimate}")
+        #     print(f"TD Target: {td_target}")       
 
         loss = self.update_q_online(td_estimate, td_target)
 
@@ -331,13 +379,16 @@ class MetricLogger:
         self.save_log = Path(save_dir) / "log"
         with open(self.save_log, "w") as f:
             f.write(
-                "Episode,Step,AvgReward,MaxReward,MinReward,StdReward,AvgLoss,MaxLoss,MinLoss,StdLoss,AvgQ,MaxQ,MinQ,StdQ\n"
+                f"{'Episode':>8}{'Step':>8}{'AvgReward':>12}{'MaxReward':>12}{'MinReward':>12}{'StdReward':>12}"
+                f"{'AvgLoss':>12}{'MaxLoss':>12}{'MinLoss':>12}{'StdLoss':>12}"
+                f"{'AvgQ':>12}{'MaxQ':>12}{'MinQ':>12}{'StdQ':>12}\n"
             )
 
         self.ep_rewards = deque(maxlen=100)
         self.ep_lengths = deque(maxlen=100)
         self.ep_avg_losses = deque(maxlen=100)
         self.ep_avg_qs = deque(maxlen=100)
+        self.ep_emotional_rewards = deque(maxlen=100)
 
         self.episode_data = []
         self.reset_episode_metrics()
@@ -416,11 +467,10 @@ class MetricLogger:
 
     def _log_to_file(self, episode, step):
         with open(self.save_log, "a") as f:
-           f.write(
-                f"{episode},{step},{self.metrics['avg_reward']},{self.metrics['max_reward']},{self.metrics['min_reward']},{self.metrics['std_reward']},"
-                f"{self.metrics['avg_loss']},{self.metrics['max_loss']},{self.metrics['min_loss']},{self.metrics['std_loss']},"
-                f"{self.metrics['avg_q']},{self.metrics['max_q']},{self.metrics['min_q']},{self.metrics['std_q']},"
-                f"{self.metrics['avg_emotional_reward']},{self.metrics['max_emotional_reward']},{self.metrics['min_emotional_reward']},{self.metrics['std_emotional_reward']}\n"
+            f.write(
+                f"{episode:>8}{step:>8}{self.metrics['avg_reward']:>12.2f}{self.metrics['max_reward']:>12.2f}{self.metrics['min_reward']:>12.2f}{self.metrics['std_reward']:>12.2f}"
+                f"{self.metrics['avg_loss']:>12.2f}{self.metrics['max_loss']:>12.2f}{self.metrics['min_loss']:>12.2f}{self.metrics['std_loss']:>12.2f}"
+                f"{self.metrics['avg_q']:>12.2f}{self.metrics['max_q']:>12.2f}{self.metrics['min_q']:>12.2f}{self.metrics['std_q']:>12.2f}\n"
             )
            
     def record(self, episode, epsilon, step):
@@ -543,8 +593,8 @@ def replay_game_from_actions(env, mario, session_path, logger, bvp_data, render_
     state = next_state
     cumulative_reward = 0.0
     bvp_step = 0
+    score = 0
     memory = []  # List to store frames for calculating emotional reward
-
 
     for action in data["obs"]:
         if render_screen:
@@ -564,19 +614,20 @@ def replay_game_from_actions(env, mario, session_path, logger, bvp_data, render_
         done = done or info.get('flag_get', False)
 
         steps += 1
-        bvp_step += 1
         cumulative_reward += reward
 
         # Calculate BVP amplitude (amp') for the current state/frame 
-        bvp_amplitude = bvp_data[bvp_step]
+        if bvp_step < len(bvp_data):
+            bvp_amplitude = bvp_data[bvp_step]
+            bvp_step+=1
         emotional_reward = calculate_emotional_reward(memory, bvp_amplitude, min_peak_value, weighting_factor)
 
         # Cache the current experience
-        mario.cache(state, next_state, action, reward, done, emotional_reward)  # Assuming cache() is updated to take bvp_amplitude
+        mario.cache(state, next_state, action, reward, done, emotional_reward)  
         state =next_state
         # Prepare frame for memory
         frame = {
-            'state': next_state,  # Adjust this according to how you store state in Mario class
+            'state': next_state,  
             'action': action,
             'reward': reward,
             'emotional_reward': emotional_reward
@@ -591,6 +642,8 @@ def replay_game_from_actions(env, mario, session_path, logger, bvp_data, render_
             finish = True
 
         if done:
+            if score < info["score"]:
+                score = info["score"]
             if finish or steps >= 16000:
                 stage_num += 1
                 world, stage, new_world = make_next_stage(world, stage, stage_num)
@@ -604,7 +657,7 @@ def replay_game_from_actions(env, mario, session_path, logger, bvp_data, render_
             next_state = env.reset()
 
             state = next_state
-
+    bvp_step = 0
     env.close()
     memory = []  # Reset memory after finishing an episode
     torch.cuda.empty_cache()
@@ -647,9 +700,9 @@ save_dir = Path("EMOcheckpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%
 save_dir.mkdir(parents=True)
 env = make_env(1,1)
 
-choice = 'new'
+choice = 'load'
 action = 'learn'
-custom_save_dir = "EMOcheckpoints/2024-06-30T10-39-29/mario_net_21282660.chkpt"
+custom_save_dir = "EMOcheckpoints/2024-07-07T10-33-01/mario_net_4605020.chkpt"
 
 # Start a new model or load an existing one based on user choice
 if choice == 'new':
